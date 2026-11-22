@@ -24,7 +24,8 @@ router.post('/preview', requireAuth, upload.single('file'), async (req, res) => 
     if (!req.file) {
       return res.status(400).json({ message: 'Please select an .xlsx file to upload.' });
     }
-    const parsed = await parseUploadedWorkbook(req.file.buffer);
+    // const parsed = await parseUploadedWorkbook(req.file.buffer);
+    const parsed = await parseUploadedWorkbook(req.file.buffer, req.file.originalname);
     res.json(parsed);
   } catch (err) {
     console.error('Excel Preview Error:', err);

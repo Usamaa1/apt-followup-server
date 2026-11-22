@@ -2,10 +2,25 @@ import ExcelJS from 'exceljs';
 
 const cleanText = (val) => {
   if (val === null || val === undefined) return '';
-  if (typeof val === 'object' && val.text) return String(val.text).trim();
-  if (typeof val === 'object' && val.result !== undefined) return String(val.result).trim();
+  if (typeof val === 'object') {
+    if (val.text) return String(val.text).trim();
+    if (val.result !== undefined) return String(val.result).trim();
+    if (Array.isArray(val.richText)) {
+      return val.richText.map((r) => r.text).join('').trim();
+    }
+  }
   return String(val).trim();
 };
+
+// Normalize header text: strip newlines, apostrophes, periods, and parenthetical notes
+const normHeader = (val) =>
+  cleanText(val)
+    .replace(/\r?\n/g, ' ')
+    .toUpperCase()
+    .replace(/['’.]/g, '')
+    .replace(/\([^)]*\)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 
 const normalizeEnrollment = (raw) => {
   const s = cleanText(raw);
@@ -20,8 +35,10 @@ const normalizeEnrollment = (raw) => {
   ) {
     return null;
   }
-  return s;
+  return s.toUpperCase();
 };
+
+const cleanStudentName = (raw) => cleanText(raw).replace(/\s+\.$/, '').trim();
 
 const extractScheduleType = (text) => {
   const upper = cleanText(text).toUpperCase();
@@ -50,10 +67,26 @@ const getWeekOfMonth = (dateStr) => {
   return 4;
 };
 
-export const parseUploadedWorkbook = async (buffer) => {
+// Extract batchCode (e.g. 2512G1, 2406C2) & facultyName from filename as fallback
+const extractMetadataFromFilename = (filename = '') => {
+  const base = String(filename || '').replace(/\.xlsx?$/i, '');
+  const batchMatch = base.match(/\b(\d{4}[A-Z]\d+)\b/i);
+  const batchCode = batchMatch ? batchMatch[1].toUpperCase() : '';
+
+  let facultyName = '';
+  const sirMatch = base.match(/^(?:sir|miss|ms|mr)\.?\s+([^_|-]+)/i);
+  if (sirMatch) {
+    facultyName = sirMatch[1].trim();
+  }
+
+  return { batchCode, facultyName };
+};
+
+export const parseUploadedWorkbook = async (buffer, originalFilename = '') => {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(buffer);
 
+  const fileMeta = extractMetadataFromFilename(originalFilename);
   const firstSheet = workbook.worksheets[0];
   const firstRowValues = [];
   firstSheet.getRow(1).eachCell((cell) => firstRowValues.push(cleanText(cell.value)));
@@ -78,8 +111,27 @@ export const parseUploadedWorkbook = async (buffer) => {
     return parseManualAttendanceSheet(firstSheet);
   }
 
-  // 3. Default: Multi-tab or Single-tab Batch Roster / Student Contact Details
-  return parseRosterOrContactWorkbook(workbook);
+  // 3. Detect Aptech eProject Submission Workbook ('Submission Format' tab or 'TEAM/GROUP' + 'PROJECT NAME')
+  const eProjectSheet =
+    workbook.worksheets.find((ws) => ws.name.trim().toUpperCase() === 'SUBMISSION FORMAT') ||
+    workbook.worksheets.find((ws) => {
+      for (let r = 1; r <= 12; r++) {
+        const vals = [];
+        ws.getRow(r).eachCell((cell) => vals.push(normHeader(cell.value)));
+        const joined = vals.join(' | ');
+        if (joined.includes('PROJECT NAME') && (joined.includes('TEAM/GROUP') || joined.includes('VIVA MARKS'))) {
+          return true;
+        }
+      }
+      return false;
+    });
+
+  if (eProjectSheet) {
+    return parseEProjectSubmissionSheet(eProjectSheet, fileMeta);
+  }
+
+  // 4. Default: Multi-tab or Single-tab Batch Roster / Student Contact Details (both banner & column formats)
+  return parseRosterOrContactWorkbook(workbook, fileMeta);
 };
 
 function parseAptrackBatches(sheet) {
@@ -100,7 +152,6 @@ function parseAptrackBatches(sheet) {
 
     if (!rawName) return;
 
-    // Extract 6-char batch code like 2410E2 or 2609C3 from T_0726_2410E2_HDSE_3D...
     const codeMatch = rawName.match(/_(\d{4}[A-Z]\d+)_/i);
     const batchCode = codeMatch ? codeMatch[1].toUpperCase() : aptrackBatchId.toUpperCase();
 
@@ -123,6 +174,7 @@ function parseAptrackBatches(sheet) {
     batches,
     students: [],
     absenteeAlerts: [],
+    eProjects: [],
   };
 }
 
@@ -133,7 +185,6 @@ function parseManualAttendanceSheet(sheet) {
   let coordinatorName = '';
   let headerRowIdx = -1;
 
-  // Scan top 10 rows for metadata and table header
   for (let r = 1; r <= 10; r++) {
     const cells = [];
     sheet.getRow(r).eachCell((cell, col) => {
@@ -189,13 +240,12 @@ function parseManualAttendanceSheet(sheet) {
 
   sheet.eachRow((row, rowNumber) => {
     if (rowNumber <= headerRowIdx) return;
-    const studentName = cleanText(row.getCell(nameCol).value);
+    const studentName = cleanStudentName(row.getCell(nameCol).value);
     if (!studentName || studentName.toUpperCase() === 'STUDENT NAME') return;
 
     const enrollmentNo = normalizeEnrollment(row.getCell(idCol).value);
     const courseCode = cleanText(row.getCell(courseCol).value);
 
-    // Group attendance by YYYY-MM + Week #
     const weeklyMap = {};
     let isFreeze = false;
 
@@ -259,21 +309,155 @@ function parseManualAttendanceSheet(sheet) {
     batches,
     students,
     absenteeAlerts,
+    eProjects: [],
   };
 }
 
-function parseRosterOrContactWorkbook(workbook) {
+function parseEProjectSubmissionSheet(sheet, fileMeta) {
+  let headerRowIdx = -1;
+  let colMap = {};
+  let projectStartDate = '';
+  let projectEndDate = '';
+
+  // Scan top 15 rows for metadata and Row 7 header
+  for (let r = 1; r <= Math.min(15, sheet.rowCount); r++) {
+    const row = sheet.getRow(r);
+    const label = normHeader(row.getCell(1).value);
+    const metaVal = formatExcelDate(row.getCell(3).value);
+    if (label.includes('PROJECT START DATE')) projectStartDate = metaVal;
+    if (label.includes('PROJECT END DATE')) projectEndDate = metaVal;
+
+    const candidate = {};
+    row.eachCell((cell, col) => {
+      const h = normHeader(cell.value);
+      if (!h) return;
+      if (h.includes('TEAM') || h.includes('GROUP')) candidate.teamGroup = col;
+      else if (h.includes('PROJECT NAME') || h.includes('PROJECT TITLE')) candidate.projectName = col;
+      else if (h.includes('ENROLLMENT')) candidate.enrollment = col;
+      else if (h === 'STUDENT NAME' || h === 'NAME') candidate.name = col;
+      else if (h.includes('COURSE FAMILY')) candidate.courseFamily = col;
+      else if (h.includes('COURSE NAME')) candidate.courseName = col;
+      else if (h.includes('SEMESTER')) candidate.semesterNumber = col;
+      else if (h.includes('VIVA MARKS') || h === 'MARKS') candidate.vivaMarks = col;
+      else if (h.includes('NAME OF STUDENT') || h.includes('SUBMITTED BY')) candidate.submittedBy = col;
+      else if (h.includes('SUBMISSION LINK')) candidate.submissionLink = col;
+      else if (h.includes('BATCH')) candidate.batchCode = col;
+    });
+
+    if (candidate.name && candidate.enrollment) {
+      headerRowIdx = r;
+      colMap = candidate;
+      break;
+    }
+  }
+
+  if (headerRowIdx === -1) headerRowIdx = 7;
+
   const batchMap = new Map();
   const students = [];
-  const skipTabs = ['BATCH END', 'DROP OUT', 'FREEZE', 'BATCH MERGED', 'BATCH DISSOLVE', 'DISSOLVE BATCHES', 'EXTRA STUDENT DATA'];
+  const eProjects = [];
+
+  // Forward-fill state for vertically merged group cells (Team/Group, Project Name, Submitted By, Submission Link)
+  let lastGroup = '';
+  let lastProjectName = '';
+  let lastSubmittedBy = '';
+  let lastSubmissionLink = '';
+
+  sheet.eachRow((row, rowNumber) => {
+    if (rowNumber <= headerRowIdx) return;
+
+    const studentName = cleanStudentName(row.getCell(colMap.name || 5).value);
+    if (!studentName || normHeader(studentName) === 'STUDENT NAME') return;
+
+    const rowBatch = colMap.batchCode ? cleanText(row.getCell(colMap.batchCode).value).toUpperCase() : '';
+    const batchCode = rowBatch || fileMeta.batchCode;
+    if (!batchCode) return;
+
+    if (!batchMap.has(batchCode)) {
+      batchMap.set(batchCode, {
+        batchCode,
+        scheduleType: 'MWF',
+        timings: 'MWF (TBD)',
+        facultyName: fileMeta.facultyName || 'Unassigned',
+        coordinatorName: '',
+        status: 'Ongoing',
+      });
+    }
+
+    const enrollmentNo = normalizeEnrollment(row.getCell(colMap.enrollment || 4).value);
+    const courseFamily = colMap.courseFamily ? cleanText(row.getCell(colMap.courseFamily).value) : '';
+    const courseName = colMap.courseName ? cleanText(row.getCell(colMap.courseName).value) : '';
+    const semesterNumber = colMap.semesterNumber ? cleanText(row.getCell(colMap.semesterNumber).value) : '';
+    const vivaMarks = colMap.vivaMarks ? cleanText(row.getCell(colMap.vivaMarks).value) : '';
+
+    const grp = colMap.teamGroup ? cleanText(row.getCell(colMap.teamGroup).value) : '';
+    const proj = colMap.projectName ? cleanText(row.getCell(colMap.projectName).value).replace(/\r?\n/g, ' ').trim() : '';
+    const subBy = colMap.submittedBy ? cleanStudentName(row.getCell(colMap.submittedBy).value) : '';
+    const link = colMap.submissionLink ? cleanText(row.getCell(colMap.submissionLink).value) : '';
+
+    if (grp) lastGroup = grp;
+    if (proj) lastProjectName = proj;
+    if (subBy) lastSubmittedBy = subBy;
+    if (link) lastSubmissionLink = link;
+
+    students.push({
+      enrollmentNo,
+      studentName,
+      courseCode: courseName,
+      ovStatus: courseFamily,
+      batchCode,
+      status: 'Active',
+    });
+
+    eProjects.push({
+      batchCode,
+      teamGroup: lastGroup,
+      projectName: lastProjectName,
+      enrollmentNo,
+      studentName,
+      courseFamily,
+      courseName,
+      semesterNumber,
+      vivaMarks,
+      submittedBy: lastSubmittedBy,
+      submissionLink: lastSubmissionLink,
+      projectStartDate,
+      projectEndDate,
+    });
+  });
+
+  const batches = Array.from(batchMap.values());
+  return {
+    detectedType: 'eproject_submission',
+    summary: `Parsed ${eProjects.length} eProject student entries across ${batches.length} batch (${batches[0]?.batchCode || 'N/A'}).`,
+    batches,
+    students,
+    absenteeAlerts: [],
+    eProjects,
+  };
+}
+
+function parseRosterOrContactWorkbook(workbook, fileMeta = {}) {
+  const batchMap = new Map();
+  const students = [];
+  const skipTabs = [
+    'BATCH END',
+    'DROP OUT',
+    'FREEZE',
+    'BATCH MERGED',
+    'BATCH DISSOLVE',
+    'DISSOLVE BATCHES',
+    'EXTRA STUDENT DATA',
+    'DATA',
+  ];
 
   workbook.worksheets.forEach((sheet) => {
     const tabUpper = sheet.name.trim().toUpperCase();
     if (skipTabs.some((s) => tabUpper.includes(s))) return;
 
-    let currentBatchCode = '';
+    let currentBatchCode = fileMeta.batchCode || '';
     let currentTimings = '';
-    let currentFaculty = '';
+    let currentFaculty = fileMeta.facultyName || '';
     let currentCoordinator = '';
     let currentCourseTitle = '';
     let colMap = {};
@@ -288,8 +472,39 @@ function parseRosterOrContactWorkbook(workbook) {
       const joined = rowCells.map((c) => c.text).join(' | ');
       const joinedUpper = joined.toUpperCase();
 
-      // Check if row defines Batch Metadata (e.g., "Batch Code: 2406C2")
-      if (joinedUpper.includes('BATCH CODE')) {
+      // 1. Detect Table Header Row FIRST (handles flat column-based rosters like 2406C2.xlsx & 2410B2.xlsx)
+      const isHeaderRow =
+        (joinedUpper.includes('ENROLLMENT') || joinedUpper.includes('STUDENT NAME') || joinedUpper.includes('NAME')) &&
+        (joinedUpper.includes('CONTACT') ||
+          joinedUpper.includes('FATHER') ||
+          joinedUpper.includes('COURSE') ||
+          joinedUpper.includes('SEMESTER') ||
+          joinedUpper.includes('EMAIL') ||
+          joinedUpper.includes('TIME SLOT'));
+
+      if (isHeaderRow) {
+        colMap = {};
+        rowCells.forEach(({ col, text }) => {
+          const u = normHeader(text);
+          if (u === 'BATCH CODE' || u === 'BATCH' || u === 'BATCH ID') colMap.batchCode = col;
+          else if (u === 'TIME SLOT' || u === 'TIMINGS' || u === 'TIMING' || u === 'SLOT') colMap.timings = col;
+          else if (u.includes('COORDINATOR')) colMap.coordinator = col;
+          else if (u === 'FACULTY' || u === 'FACULTY NAME') colMap.faculty = col;
+          else if (u.includes('ENROLLMENT') || u.includes('STD ID')) colMap.enrollment = col;
+          else if (u === 'NAME' || u.includes('STUDENT NAME')) colMap.name = col;
+          else if (u.includes('FATHER') || u.includes('GUARDIAN')) colMap.father = col;
+          else if (u.includes('STUDENT CONTACT') || u.includes('STUDENTS CONTACT') || u === 'CONTACT 1') colMap.studentPhone = col;
+          else if (u.includes('PARENT CONTACT') || u.includes('PARENTS CONTACT') || u === 'CONTACT 2') colMap.parentsPhone = col;
+          else if (u.includes('COURSE') || u === 'SEMESTER') colMap.course = col;
+          else if (u.includes('ADDRESS')) colMap.address = col;
+          else if (u.includes('EMAIL')) colMap.email = col;
+          else if (u.includes('OV STATUS')) colMap.ovStatus = col;
+        });
+        return;
+      }
+
+      // 2. Check if row is a Batch Metadata Banner (e.g., "Batch Code: 2406C2" in multi-batch sheets)
+      if (joinedUpper.includes('BATCH CODE') && !colMap.name) {
         const codeMatch = joined.match(/BATCH CODE\s*:?\s*([A-Z0-9']+)/i);
         if (codeMatch) {
           currentBatchCode = codeMatch[1].replace(/'/g, '').toUpperCase();
@@ -309,7 +524,6 @@ function parseRosterOrContactWorkbook(workbook) {
         if (facMatch) {
           currentFaculty = facMatch[1].trim();
         } else {
-          // Format like "Batch Code: 2308B2 (MWF 9-11)"
           const trailingPerson = joined.match(/\)\s*-?\s*((?:MISS|SIR|MS\.?|MR\.?)\s+[A-Z\s.]+)/i);
           if (trailingPerson) currentFaculty = trailingPerson[1].trim();
         }
@@ -328,37 +542,44 @@ function parseRosterOrContactWorkbook(workbook) {
         return;
       }
 
-      // Capture top title line for course title
-      if (row.number === 1 && !joinedUpper.includes('ENROLLMENT')) {
+      // Capture top title line for course title (only if row 1 is not already a header)
+      if (row.number === 1 && !colMap.name) {
         currentCourseTitle = rowCells[0]?.text || '';
         return;
       }
 
-      // Detect table header row
-      if (
-        (joinedUpper.includes('ENROLLMENT') || joinedUpper.includes('STUDENT NAME') || joinedUpper.includes('NAME')) &&
-        (joinedUpper.includes('CONTACT') || joinedUpper.includes('FATHER') || joinedUpper.includes('COURSES'))
-      ) {
-        colMap = {};
-        rowCells.forEach(({ col, text }) => {
-          const u = text.toUpperCase();
-          if (u.includes('ENROLLMENT') || u.includes('STD. ID')) colMap.enrollment = col;
-          else if (u === 'NAME' || u.includes('STUDENT NAME')) colMap.name = col;
-          else if (u.includes('FATHER') || u.includes('GUARDIAN')) colMap.father = col;
-          else if (u.includes('STUDENT CONTACT') || u === 'CONTACT 1') colMap.studentPhone = col;
-          else if (u.includes('PARENTS CONTACT') || u === 'CONTACT 2') colMap.parentsPhone = col;
-          else if (u.includes('COURSE')) colMap.course = col;
-          else if (u.includes('ADDRESS')) colMap.address = col;
-          else if (u.includes('EMAIL')) colMap.email = col;
-          else if (u.includes('OV STATUS')) colMap.ovStatus = col;
-        });
-        return;
-      }
-
-      // Parse Student Data Row
-      if (colMap.name && currentBatchCode) {
-        const studentName = cleanText(row.getCell(colMap.name).value);
+      // 3. Parse Student Data Row (supports batch metadata either from row columns OR banner above)
+      if (colMap.name) {
+        const studentName = cleanStudentName(row.getCell(colMap.name).value);
         if (!studentName || studentName.toUpperCase().includes('STUDENT NAME')) return;
+
+        const rowBatchCode = colMap.batchCode
+          ? cleanText(row.getCell(colMap.batchCode).value).replace(/'/g, '').toUpperCase()
+          : currentBatchCode;
+
+        if (!rowBatchCode) return;
+
+        const rowTimings = colMap.timings
+          ? cleanText(row.getCell(colMap.timings).value)
+          : currentTimings;
+        const rowFaculty = colMap.faculty
+          ? cleanText(row.getCell(colMap.faculty).value)
+          : currentFaculty;
+        const rowCoordinator = colMap.coordinator
+          ? cleanText(row.getCell(colMap.coordinator).value)
+          : currentCoordinator;
+
+        if (!batchMap.has(rowBatchCode)) {
+          batchMap.set(rowBatchCode, {
+            batchCode: rowBatchCode,
+            scheduleType: extractScheduleType(rowTimings),
+            timings: rowTimings || `${extractScheduleType(rowTimings)} (TBD)`,
+            facultyName: rowFaculty || 'Unassigned',
+            coordinatorName: rowCoordinator,
+            courseTitle: currentCourseTitle,
+            status: 'Ongoing',
+          });
+        }
 
         students.push({
           enrollmentNo: colMap.enrollment ? normalizeEnrollment(row.getCell(colMap.enrollment).value) : null,
@@ -370,7 +591,7 @@ function parseRosterOrContactWorkbook(workbook) {
           address: colMap.address ? cleanText(row.getCell(colMap.address).value) : '',
           email: colMap.email ? cleanText(row.getCell(colMap.email).value).toLowerCase() : '',
           ovStatus: colMap.ovStatus ? cleanText(row.getCell(colMap.ovStatus).value) : '',
-          batchCode: currentBatchCode,
+          batchCode: rowBatchCode,
           status: 'Active',
         });
       }
@@ -384,5 +605,6 @@ function parseRosterOrContactWorkbook(workbook) {
     batches,
     students,
     absenteeAlerts: [],
+    eProjects: [],
   };
 }
