@@ -8,7 +8,15 @@ import { requireAuth } from '../middleware/auth.js';
 import { parseUploadedWorkbook } from '../utils/excelParser.js';
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+
+// Vercel serverless payload ceiling is 4.5 MB
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 4.5 * 1024 * 1024 },
+});
+
+const normalizeEnrollment = (val) =>
+  val ? String(val).trim().toUpperCase() : null;
 
 // 1. Preview Parsed Excel File
 router.post('/preview', requireAuth, upload.single('file'), async (req, res) => {
@@ -35,7 +43,7 @@ router.post('/commit', requireAuth, async (req, res) => {
     let studentsMerged = 0;
     let followUpsCreated = 0;
 
-   // Step A: Upsert Batches & link Faculty User ID if displayName matches
+    // Step A: Upsert Batches & link Faculty User ID if displayName matches
     for (const b of batches) {
       if (!b.batchCode) continue;
       const code = b.batchCode.toUpperCase().trim();
@@ -79,7 +87,8 @@ router.post('/commit', requireAuth, async (req, res) => {
       batchIdByCode.set(code, savedBatch);
       batchesUpserted += 1;
     }
-    // Step B: Merge Students (Match by Enrollment No first, fallback to Student Name + Phone)
+
+    // Step B: Merge Students (Match by normalized Enrollment No first, fallback to Student Name + Phone)
     for (const s of students) {
       if (!s.studentName) continue;
       const code = (s.batchCode || '').toUpperCase().trim();
@@ -90,9 +99,11 @@ router.post('/commit', requireAuth, async (req, res) => {
       }
       if (!batchDoc) continue;
 
+      const cleanEnrollment = normalizeEnrollment(s.enrollmentNo);
+
       let existing = null;
-      if (s.enrollmentNo) {
-        existing = await Student.findOne({ enrollmentNo: s.enrollmentNo });
+      if (cleanEnrollment) {
+        existing = await Student.findOne({ enrollmentNo: cleanEnrollment });
       }
       if (!existing) {
         const nameRegex = new RegExp(`^${s.studentName.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
@@ -102,7 +113,7 @@ router.post('/commit', requireAuth, async (req, res) => {
       }
 
       if (existing) {
-        if (s.enrollmentNo && !existing.enrollmentNo) existing.enrollmentNo = s.enrollmentNo;
+        if (cleanEnrollment && !existing.enrollmentNo) existing.enrollmentNo = cleanEnrollment;
         if (s.studentPhone) existing.studentPhone = s.studentPhone.trim();
         if (s.parentsPhone) existing.parentsPhone = s.parentsPhone.trim();
         if (s.email) existing.email = s.email.trim().toLowerCase();
@@ -115,7 +126,7 @@ router.post('/commit', requireAuth, async (req, res) => {
         await existing.save();
       } else {
         await Student.create({
-          enrollmentNo: s.enrollmentNo || null,
+          enrollmentNo: cleanEnrollment,
           studentName: s.studentName.trim(),
           studentPhone: s.studentPhone?.trim() || '',
           parentsPhone: s.parentsPhone?.trim() || '',
@@ -137,9 +148,11 @@ router.post('/commit', requireAuth, async (req, res) => {
       const batchDoc = batchIdByCode.get(code) || (await Batch.findOne({ batchCode: code }));
       if (!batchDoc) continue;
 
+      const cleanAlertEnrollment = normalizeEnrollment(alert.enrollmentNo);
+
       let studentDoc = null;
-      if (alert.enrollmentNo) {
-        studentDoc = await Student.findOne({ enrollmentNo: alert.enrollmentNo });
+      if (cleanAlertEnrollment) {
+        studentDoc = await Student.findOne({ enrollmentNo: cleanAlertEnrollment });
       }
       if (!studentDoc) {
         const nameRegex = new RegExp(`^${alert.studentName.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');

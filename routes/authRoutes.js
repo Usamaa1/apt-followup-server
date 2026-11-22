@@ -95,12 +95,14 @@ router.get('/google/callback', async (req, res) => {
       expiresIn: '7d',
     });
 
-    res.cookie('token', sessionToken, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: process.env.NODE_ENV === 'production',
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
+const isProd = process.env.NODE_ENV === 'production';
+
+res.cookie('token', sessionToken, {
+  httpOnly: true,
+  sameSite: isProd ? 'none' : 'lax',
+  secure: isProd,
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+});
 
     res.redirect(`${process.env.CLIENT_URL}/followup`);
   } catch (err) {
@@ -160,8 +162,12 @@ router.patch('/settings', requireAuth, async (req, res) => {
 
 // 5. Logout
 router.post('/logout', (req, res) => {
-  res.clearCookie('token');
+  const isProd = process.env.NODE_ENV === 'production';
+  res.clearCookie('token', {
+    httpOnly: true,
+    sameSite: isProd ? 'none' : 'lax',
+    secure: isProd,
+  });
   res.json({ message: 'Logged out successfully.' });
 });
-
 export default router;
